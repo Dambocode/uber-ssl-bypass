@@ -184,7 +184,11 @@ log ""
 log "--- Frida Version Check ---"
 
 FRIDA_BINARY="/data/local/tmp/hluda-server"
-PC_FRIDA_VER=$(frida --version 2>/dev/null | tr -d '\r\n')
+# Use Python library version as truth — the binary in PATH may be stale
+PC_FRIDA_VER=$(python3 -c "import frida; print(frida.__version__)" 2>/dev/null | tr -d '\r\n')
+if [ -z "$PC_FRIDA_VER" ]; then
+    PC_FRIDA_VER=$(frida --version 2>/dev/null | tr -d '\r\n')
+fi
 DEVICE_FRIDA_VER=$(adb shell su -c "$FRIDA_BINARY --version" 2>/dev/null | tr -d '\r\n')
 
 log "  PC frida-tools: v$PC_FRIDA_VER"
@@ -298,32 +302,65 @@ upgrade_pc_frida() {
         return 1
     fi
 
-    # Refresh version — check PATH and common locations
-    PC_FRIDA_VER=$(frida --version 2>/dev/null | tr -d '\r\n')
-    if [ -z "$PC_FRIDA_VER" ]; then
-        for FRIDA_BIN in "$HOME/Library/Python/3.*/bin/frida" "$HOME/.local/bin/frida" "/opt/homebrew/bin/frida" "/usr/local/bin/frida"; do
+    # Get the REAL installed version from the Python module (not the binary in PATH)
+    local LIB_VER=$(python3 -c "import frida; print(frida.__version__)" 2>/dev/null | tr -d '\r\n')
+    local BIN_VER=$(frida --version 2>/dev/null | tr -d '\r\n')
+
+    log "  Python library version: v${LIB_VER:-unknown}"
+    log "  Binary in PATH version: v${BIN_VER:-unknown}"
+
+    if [ -n "$LIB_VER" ] && [ "$LIB_VER" != "$BIN_VER" ]; then
+        warn "VERSION MISMATCH: 'frida' in PATH is v${BIN_VER} but pip installed v${LIB_VER}"
+        warn "The binary in PATH is from a different install"
+
+        # Find the correct binary that matches the library
+        CORRECT_BIN=""
+        for FRIDA_BIN in \
+            "$HOME/Library/Python/3.*/bin/frida" \
+            "$HOME/.local/bin/frida" \
+            "/opt/homebrew/bin/frida" \
+            "/usr/local/bin/frida" \
+            "/Library/Frameworks/Python.framework/Versions/3.*/bin/frida"; do
             FOUND=$(ls $FRIDA_BIN 2>/dev/null | head -1)
             if [ -n "$FOUND" ]; then
-                PC_FRIDA_VER=$("$FOUND" --version 2>/dev/null | tr -d '\r\n')
-                if [ -n "$PC_FRIDA_VER" ]; then
-                    warn "frida installed at $FOUND — add to PATH"
+                FOUND_VER=$("$FOUND" --version 2>/dev/null | tr -d '\r\n')
+                log "  Found: $FOUND → v${FOUND_VER}"
+                if [ "$FOUND_VER" = "$LIB_VER" ]; then
+                    CORRECT_BIN="$FOUND"
                     break
                 fi
             fi
         done
-    fi
 
-    if [ -z "$PC_FRIDA_VER" ]; then
-        fail "frida not in PATH after upgrade"
+        if [ -n "$CORRECT_BIN" ]; then
+            FRIDA_BIN_DIR=$(dirname "$CORRECT_BIN")
+            pass "Correct frida binary: $CORRECT_BIN (v${LIB_VER})"
+            warn "Adding $FRIDA_BIN_DIR to PATH for this session"
+            export PATH="$FRIDA_BIN_DIR:$PATH"
+            PC_FRIDA_VER="$LIB_VER"
+        else
+            warn "Could not find matching binary — using library version for server download"
+            PC_FRIDA_VER="$LIB_VER"
+            echo ""
+            echo "  The 'frida' command will use v${BIN_VER} but server will be v${LIB_VER}"
+            echo "  To fix permanently, add the pip bin dir to your PATH:"
+            echo "    export PATH=\"\$HOME/Library/Python/3.9/bin:\$PATH\""
+            echo ""
+        fi
+    elif [ -n "$LIB_VER" ]; then
+        PC_FRIDA_VER="$LIB_VER"
+    elif [ -n "$BIN_VER" ]; then
+        PC_FRIDA_VER="$BIN_VER"
+    else
+        fail "frida not found after upgrade"
         return 1
     fi
 
     if [ "$PC_FRIDA_VER" = "$OLD_VER" ]; then
-        warn "Version unchanged at v${PC_FRIDA_VER} — pip may have a stale index"
-        echo ""
-        echo "Force install latest manually:"
-        echo "  pip3 install --no-cache-dir --force-reinstall frida-tools frida"
-        echo ""
+        warn "Version unchanged at v${PC_FRIDA_VER}"
+        echo "  pip says it's already the latest"
+        echo "  If you expected a newer version, try:"
+        echo "    pip3 install --no-cache-dir --force-reinstall frida-tools frida"
         return 1
     fi
 
