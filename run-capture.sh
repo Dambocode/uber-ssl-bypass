@@ -55,41 +55,60 @@ sleep 1
 # Disable SELinux (common Frida blocker)
 adb shell su -c "setenforce 0" 2>/dev/null || true
 
-# Start Frida server (nohup so it fully detaches from adb shell)
+# Helper: test frida-ps with a timeout (macOS has no `timeout` command)
+test_frida_ps() {
+    local mode="$1"
+    frida-ps $mode > /tmp/frida-ps-out 2>&1 &
+    local pid=$!
+    ( sleep 8; kill "$pid" 2>/dev/null ) &
+    local watcher=$!
+    wait "$pid" 2>/dev/null
+    local ret=$?
+    kill "$watcher" 2>/dev/null 2>&1
+    wait "$watcher" 2>/dev/null 2>&1
+    if [ $ret -eq 0 ] && head -3 /tmp/frida-ps-out | grep -q "[0-9]"; then
+        return 0
+    fi
+    return 1
+}
+
+# Start Frida server — TCP + adb forward is most reliable on macOS
 echo "[*] Starting Frida server..."
 if [ "$FRIDA_MODE" = "-U" ]; then
-    adb shell su -c "nohup /data/local/tmp/hluda-server >/dev/null 2>&1 &"
-else
-    adb shell su -c "nohup /data/local/tmp/hluda-server -l 0.0.0.0:1337 >/dev/null 2>&1 &"
-    sleep 1
-    adb forward tcp:1337 tcp:1337 2>/dev/null || true
-fi
-sleep 3
+    # Default to TCP+forward (works better on macOS), fall back to USB
+    adb shell su -c "nohup /data/local/tmp/hluda-server -l 0.0.0.0:27042 >/dev/null 2>&1 &"
+    sleep 3
+    adb forward tcp:27042 tcp:27042 2>/dev/null || true
 
-# Verify Frida is running
-echo "[*] Verifying Frida connection..."
-if frida-ps $FRIDA_MODE 2>/dev/null | head -3 | grep -q "[0-9]"; then
-    echo "[+] Frida server connected."
-else
-    echo "[!] Frida not responding. Trying alternate methods..."
-
-    # Try TCP fallback if USB failed
-    if [ "$FRIDA_MODE" = "-U" ]; then
+    echo "[*] Verifying Frida connection (TCP + adb forward)..."
+    if test_frida_ps "-H 127.0.0.1:27042"; then
+        echo "[+] Frida connected via TCP (port 27042)."
+        FRIDA_MODE="-H 127.0.0.1:27042"
+    else
+        echo "[!] TCP failed, trying USB mode..."
         adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null || true
         sleep 1
-        adb shell su -c "nohup /data/local/tmp/hluda-server -l 127.0.0.1:1337 >/dev/null 2>&1 &"
+        adb shell su -c "nohup /data/local/tmp/hluda-server >/dev/null 2>&1 &"
         sleep 3
-        adb forward tcp:1337 tcp:1337 2>/dev/null || true
-        FRIDA_MODE="-H 127.0.0.1:1337"
 
-        if frida-ps $FRIDA_MODE 2>/dev/null | head -3 | grep -q "[0-9]"; then
-            echo "[+] Frida connected via TCP fallback (port 1337)."
+        if test_frida_ps "-U"; then
+            echo "[+] Frida connected via USB."
+            FRIDA_MODE="-U"
         else
             echo "[!] Cannot connect to Frida. Run these manually to debug:"
             echo "    adb shell su -c '/data/local/tmp/hluda-server'"
             echo "    (should print 'Listening on...' — if error, paste it)"
             exit 1
         fi
+    fi
+else
+    adb shell su -c "nohup /data/local/tmp/hluda-server -l 0.0.0.0:1337 >/dev/null 2>&1 &"
+    sleep 3
+    adb forward tcp:1337 tcp:1337 2>/dev/null || true
+
+    echo "[*] Verifying Frida connection..."
+    if test_frida_ps "$FRIDA_MODE"; then
+        echo "[+] Frida connected."
     else
         echo "[!] Cannot connect to Frida. Run these manually to debug:"
         echo "    adb shell su -c '/data/local/tmp/hluda-server'"

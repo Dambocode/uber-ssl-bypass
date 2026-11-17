@@ -17,6 +17,28 @@ PROXY_PORT=8080
 LOG="debug.log"
 HAR="uber_capture_$(date +%Y%m%d_%H%M%S).har"
 
+# macOS doesn't have `timeout` — use gtimeout or a portable fallback
+if command -v timeout &>/dev/null; then
+    TIMEOUT="timeout"
+elif command -v gtimeout &>/dev/null; then
+    TIMEOUT="gtimeout"
+else
+    # Pure bash fallback: run command in background, kill after N seconds
+    _timeout() {
+        local secs="$1"; shift
+        "$@" &
+        local pid=$!
+        ( sleep "$secs"; kill "$pid" 2>/dev/null ) &
+        local watcher=$!
+        wait "$pid" 2>/dev/null
+        local ret=$?
+        kill "$watcher" 2>/dev/null
+        wait "$watcher" 2>/dev/null
+        return $ret
+    }
+    TIMEOUT="_timeout"
+fi
+
 # Parse args
 SYNC_MODE="auto"
 while [[ $# -gt 0 ]]; do
@@ -314,43 +336,60 @@ if [ "$HAS_ROOT" = true ]; then
     adb shell su -c "setenforce 0" 2>/dev/null
     log "SELinux set to permissive"
 
-    # ── Try Method 1: USB mode on default port ───────────────────
-    log ""
-    log "--- Starting Frida Server (Attempt 1: USB mode) ---"
-    adb shell su -c "nohup $FRIDA_BINARY >/dev/null 2>&1 &"
-    sleep 3
+    # Helper: test frida-ps with a timeout (macOS has no `timeout` command)
+    test_frida_ps() {
+        local mode="$1"
+        frida-ps $mode > /tmp/frida-ps-out 2>&1 &
+        local pid=$!
+        ( sleep 8; kill "$pid" 2>/dev/null ) &
+        local watcher=$!
+        wait "$pid" 2>/dev/null
+        local ret=$?
+        kill "$watcher" 2>/dev/null 2>&1
+        wait "$watcher" 2>/dev/null 2>&1
+        if [ $ret -eq 0 ] && head -3 /tmp/frida-ps-out | grep -q "[0-9]"; then
+            return 0
+        fi
+        return 1
+    }
 
-    if frida-ps -U 2>/dev/null | head -3 | grep -q "[0-9]"; then
-        pass "Frida connected via USB (default port)"
-        FRIDA_MODE="-U"
+    # ── Try Method 1: TCP with adb forward (most reliable on macOS) ──
+    log ""
+    log "--- Starting Frida Server (Attempt 1: TCP + adb forward) ---"
+    adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:27042 >/dev/null 2>&1 &"
+    sleep 3
+    adb forward tcp:27042 tcp:27042 2>/dev/null
+
+    if test_frida_ps "-H 127.0.0.1:27042"; then
+        pass "Frida connected via TCP (port 27042 + adb forward)"
+        FRIDA_MODE="-H 127.0.0.1:27042"
         FRIDA_OK=true
     else
-        warn "USB mode failed, trying TCP on port 1337..."
+        warn "TCP 27042 failed, trying USB mode..."
 
-        # ── Try Method 2: TCP mode on custom port ────────────────
+        # ── Try Method 2: USB mode ──────────────────────────────
         adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
         sleep 1
-        adb shell su -c "nohup $FRIDA_BINARY -l 127.0.0.1:1337 >/dev/null 2>&1 &"
+        adb shell su -c "nohup $FRIDA_BINARY >/dev/null 2>&1 &"
         sleep 3
-        adb forward tcp:1337 tcp:1337 2>/dev/null
 
-        if frida-ps -H 127.0.0.1:1337 2>/dev/null | head -3 | grep -q "[0-9]"; then
-            pass "Frida connected via TCP (port 1337)"
-            FRIDA_MODE="-H 127.0.0.1:1337"
+        if test_frida_ps "-U"; then
+            pass "Frida connected via USB"
+            FRIDA_MODE="-U"
             FRIDA_OK=true
         else
-            warn "TCP mode 1337 failed, trying port 27042 with adb forward..."
+            warn "USB mode failed, trying TCP on port 1337..."
 
-            # ── Try Method 3: Default port with adb forward ──────
+            # ── Try Method 3: TCP on custom port ─────────────────
             adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
             sleep 1
-            adb shell su -c "nohup $FRIDA_BINARY -l 127.0.0.1:27042 >/dev/null 2>&1 &"
+            adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:1337 >/dev/null 2>&1 &"
             sleep 3
-            adb forward tcp:27042 tcp:27042 2>/dev/null
+            adb forward tcp:1337 tcp:1337 2>/dev/null
 
-            if frida-ps -H 127.0.0.1:27042 2>/dev/null | head -3 | grep -q "[0-9]"; then
-                pass "Frida connected via TCP (port 27042)"
-                FRIDA_MODE="-H 127.0.0.1:27042"
+            if test_frida_ps "-H 127.0.0.1:1337"; then
+                pass "Frida connected via TCP (port 1337)"
+                FRIDA_MODE="-H 127.0.0.1:1337"
                 FRIDA_OK=true
             else
                 fail "All Frida connection methods failed"
@@ -434,9 +473,9 @@ LAUNCHED=false
 
 # Method 1: frida spawn with -f (preferred — hooks before app init)
 log "Trying: frida $FRIDA_MODE -f com.ubercab.driver -l $SCRIPT"
-timeout 15 frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" >> "$LOG" 2>&1 &
+frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" >> "$LOG" 2>&1 &
 FRIDA_PID=$!
-sleep 5
+sleep 8
 
 if kill -0 "$FRIDA_PID" 2>/dev/null; then
     if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
@@ -445,6 +484,8 @@ if kill -0 "$FRIDA_PID" 2>/dev/null; then
     else
         kill "$FRIDA_PID" 2>/dev/null
     fi
+else
+    log "Spawn process exited early"
 fi
 
 if [ "$LAUNCHED" != true ]; then
@@ -457,9 +498,9 @@ if [ "$LAUNCHED" != true ]; then
     sleep 3
 
     # Attach with script
-    timeout 15 frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" >> "$LOG" 2>&1 &
+    frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" >> "$LOG" 2>&1 &
     FRIDA_PID=$!
-    sleep 5
+    sleep 8
 
     if kill -0 "$FRIDA_PID" 2>/dev/null; then
         if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
@@ -468,6 +509,8 @@ if [ "$LAUNCHED" != true ]; then
         else
             kill "$FRIDA_PID" 2>/dev/null
         fi
+    else
+        log "Attach process exited early"
     fi
 fi
 
@@ -481,9 +524,9 @@ if [ "$LAUNCHED" != true ]; then
     sleep 5
 
     # Attach with script after app has fully started
-    timeout 15 frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" >> "$LOG" 2>&1 &
+    frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" >> "$LOG" 2>&1 &
     FRIDA_PID=$!
-    sleep 5
+    sleep 8
 
     if kill -0 "$FRIDA_PID" 2>/dev/null; then
         if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
@@ -493,6 +536,8 @@ if [ "$LAUNCHED" != true ]; then
         else
             kill "$FRIDA_PID" 2>/dev/null
         fi
+    else
+        log "Late attach process exited early"
     fi
 fi
 
