@@ -158,15 +158,16 @@ if [ ! -f "$SCRIPT" ]; then
 fi
 pass "Bypass script: $SCRIPT"
 
-# ── Kill everything first ────────────────────────────────────────
+# ── Kill app and proxy (but NOT Frida server — reuse if version matches) ──
 log ""
 log "--- Cleanup ---"
 adb shell am force-stop com.ubercab.driver 2>/dev/null
-adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
-adb shell su -c "pkill -9 -f frida-server" 2>/dev/null
 adb shell settings put global http_proxy :0 2>/dev/null
+adb reverse --remove-all 2>/dev/null
+adb shell su -c "iptables -t nat -F OUTPUT" 2>/dev/null
+killall mitmdump 2>/dev/null || true
 sleep 1
-pass "Killed existing Frida and Uber processes"
+pass "Killed Uber, cleared proxy"
 
 # ── Push bypass script ───────────────────────────────────────────
 log ""
@@ -353,46 +354,59 @@ if [ "$HAS_ROOT" = true ]; then
         return 1
     }
 
-    # ── Try Method 1: TCP with adb forward (most reliable on macOS) ──
+    # Check if Frida server is already running (reuse from previous run)
     log ""
-    log "--- Starting Frida Server (Attempt 1: TCP + adb forward) ---"
-    adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:27042 >/dev/null 2>&1 &"
-    sleep 3
     adb forward tcp:27042 tcp:27042 2>/dev/null
-
     if test_frida_ps "-H 127.0.0.1:27042"; then
-        pass "Frida connected via TCP (port 27042 + adb forward)"
+        pass "Frida server already running (reusing)"
         FRIDA_MODE="-H 127.0.0.1:27042"
         FRIDA_OK=true
     else
-        warn "TCP 27042 failed, trying USB mode..."
-
-        # ── Try Method 2: USB mode ──────────────────────────────
+        # Not running — kill any stale process and start fresh
         adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
-        sleep 1
-        adb shell su -c "nohup $FRIDA_BINARY >/dev/null 2>&1 &"
-        sleep 3
+        adb shell su -c "pkill -9 -f frida-server" 2>/dev/null
+        sleep 2
 
-        if test_frida_ps "-U"; then
-            pass "Frida connected via USB"
-            FRIDA_MODE="-U"
+        # ── Try Method 1: TCP with adb forward (most reliable on macOS) ──
+        log "--- Starting Frida Server (Attempt 1: TCP + adb forward) ---"
+        adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:27042 >/dev/null 2>&1 &"
+        sleep 3
+        adb forward tcp:27042 tcp:27042 2>/dev/null
+
+        if test_frida_ps "-H 127.0.0.1:27042"; then
+            pass "Frida connected via TCP (port 27042 + adb forward)"
+            FRIDA_MODE="-H 127.0.0.1:27042"
             FRIDA_OK=true
         else
-            warn "USB mode failed, trying TCP on port 1337..."
+            warn "TCP 27042 failed, trying USB mode..."
 
-            # ── Try Method 3: TCP on custom port ─────────────────
+            # ── Try Method 2: USB mode ──────────────────────────────
             adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
             sleep 1
-            adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:1337 >/dev/null 2>&1 &"
+            adb shell su -c "nohup $FRIDA_BINARY >/dev/null 2>&1 &"
             sleep 3
-            adb forward tcp:1337 tcp:1337 2>/dev/null
 
-            if test_frida_ps "-H 127.0.0.1:1337"; then
-                pass "Frida connected via TCP (port 1337)"
-                FRIDA_MODE="-H 127.0.0.1:1337"
+            if test_frida_ps "-U"; then
+                pass "Frida connected via USB"
+                FRIDA_MODE="-U"
                 FRIDA_OK=true
             else
-                fail "All Frida connection methods failed"
+                warn "USB mode failed, trying TCP on port 1337..."
+
+                # ── Try Method 3: TCP on custom port ─────────────────
+                adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
+                sleep 1
+                adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:1337 >/dev/null 2>&1 &"
+                sleep 3
+                adb forward tcp:1337 tcp:1337 2>/dev/null
+
+                if test_frida_ps "-H 127.0.0.1:1337"; then
+                    pass "Frida connected via TCP (port 1337)"
+                    FRIDA_MODE="-H 127.0.0.1:1337"
+                    FRIDA_OK=true
+                else
+                    fail "All Frida connection methods failed"
+                fi
             fi
         fi
     fi
@@ -685,16 +699,39 @@ fi
 log ""
 log "--- Launching Uber Driver ---"
 
+# Verify Frida server is still alive RIGHT before we launch
+log "Verifying Frida server is still alive..."
+if ! test_frida_ps "$FRIDA_MODE"; then
+    warn "Frida server died — restarting..."
+    adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
+    sleep 1
+    adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:27042 >/dev/null 2>&1 &"
+    sleep 3
+    adb forward tcp:27042 tcp:27042 2>/dev/null
+    if test_frida_ps "-H 127.0.0.1:27042"; then
+        FRIDA_MODE="-H 127.0.0.1:27042"
+        pass "Frida server restarted"
+    else
+        fail "Cannot restart Frida server"
+        exit 1
+    fi
+fi
+pass "Frida server alive"
+
 # Force stop first
 adb shell am force-stop com.ubercab.driver 2>/dev/null
 sleep 1
 
-# Try spawn methods in order
 LAUNCHED=false
+FRIDA_PID=""
+
+# Create a tee pipe so Frida output goes to both screen AND log
+FRIDA_PIPE="/tmp/frida-output-$$"
+mkfifo "$FRIDA_PIPE" 2>/dev/null || true
 
 # Method 1: frida spawn with -f (preferred — hooks before app init)
 log "Trying: frida $FRIDA_MODE -f com.ubercab.driver -l $SCRIPT"
-frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" >> "$LOG" 2>&1 &
+frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
 FRIDA_PID=$!
 sleep 8
 
@@ -706,7 +743,7 @@ if kill -0 "$FRIDA_PID" 2>/dev/null; then
         kill "$FRIDA_PID" 2>/dev/null
     fi
 else
-    log "Spawn process exited early"
+    log "Spawn process exited early — check output above for errors"
 fi
 
 if [ "$LAUNCHED" != true ]; then
@@ -719,7 +756,7 @@ if [ "$LAUNCHED" != true ]; then
     sleep 3
 
     # Attach with script
-    frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" >> "$LOG" 2>&1 &
+    frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
     FRIDA_PID=$!
     sleep 8
 
@@ -731,12 +768,12 @@ if [ "$LAUNCHED" != true ]; then
             kill "$FRIDA_PID" 2>/dev/null
         fi
     else
-        log "Attach process exited early"
+        log "Attach process exited early — check output above for errors"
     fi
 fi
 
 if [ "$LAUNCHED" != true ]; then
-    log "Method 2 failed, trying late attach with delayed script..."
+    log "Method 2 failed, trying late attach..."
     adb shell am force-stop com.ubercab.driver 2>/dev/null
     sleep 1
 
@@ -744,23 +781,24 @@ if [ "$LAUNCHED" != true ]; then
     adb shell monkey -p com.ubercab.driver -c android.intent.category.LAUNCHER 1 >> "$LOG" 2>&1
     sleep 5
 
-    # Attach with script after app has fully started
-    frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" >> "$LOG" 2>&1 &
+    frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
     FRIDA_PID=$!
     sleep 8
 
     if kill -0 "$FRIDA_PID" 2>/dev/null; then
         if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
             pass "Method 3 (late attach): App launched!"
-            warn "Some early hooks may have missed init — SSL bypass might be partial"
+            warn "Some early hooks may have missed init"
             LAUNCHED=true
         else
             kill "$FRIDA_PID" 2>/dev/null
         fi
     else
-        log "Late attach process exited early"
+        log "Late attach exited early — check output above for errors"
     fi
 fi
+
+rm -f "$FRIDA_PIPE" 2>/dev/null
 
 # ── Results ──────────────────────────────────────────────────────
 log ""
@@ -779,7 +817,6 @@ if [ "$LAUNCHED" = true ]; then
         echo "Press Ctrl+C when done to cleanup."
     fi
     echo ""
-    echo "Frida logs: tail -f $LOG"
     echo ""
 
     # Keep running until Ctrl+C
@@ -803,17 +840,80 @@ if [ "$LAUNCHED" = true ]; then
     }
     trap cleanup INT TERM
 
-    # Stream Frida output
-    if [ -n "$FRIDA_PID" ] && kill -0 "$FRIDA_PID" 2>/dev/null; then
-        wait "$FRIDA_PID" 2>/dev/null
-    else
-        log "Monitoring... (Ctrl+C to stop)"
-        while adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; do
-            sleep 5
-        done
-        warn "Uber Driver process exited"
-        cleanup
-    fi
+    # Monitor: watch for app crashes and auto-restart
+    CRASH_COUNT=0
+    MAX_CRASHES=3
+    log "Monitoring app (will auto-restart up to $MAX_CRASHES times)..."
+    log "Frida output is live above. Press Ctrl+C to stop."
+    echo ""
+
+    while true; do
+        # Wait for Frida process or check app status
+        if [ -n "$FRIDA_PID" ] && kill -0 "$FRIDA_PID" 2>/dev/null; then
+            # Frida process alive — check if app is still running
+            if ! adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
+                CRASH_COUNT=$((CRASH_COUNT + 1))
+                warn "Uber Driver crashed (crash #$CRASH_COUNT of $MAX_CRASHES)"
+
+                if [ $CRASH_COUNT -ge $MAX_CRASHES ]; then
+                    fail "App crashed $MAX_CRASHES times — stopping"
+                    echo ""
+                    echo "The app keeps crashing. Check the Frida output above for errors."
+                    echo "Common causes:"
+                    echo "  - SSL bypass script error (look for 'Error' in output)"
+                    echo "  - App detects Frida after a few seconds"
+                    echo "  - Network connection fails and app exits"
+                    echo ""
+                    echo "Debug: check the last captured traffic in $HAR"
+                    if [ -f "./$HAR" ]; then
+                        HAR_SIZE=$(ls -lh "./$HAR" 2>/dev/null | awk '{print $5}')
+                        log "HAR so far: $HAR ($HAR_SIZE)"
+                    fi
+                    cleanup
+                fi
+
+                # Kill old Frida, restart app
+                kill "$FRIDA_PID" 2>/dev/null
+                sleep 2
+
+                warn "Auto-restarting (attempt $((CRASH_COUNT + 1)))..."
+                adb shell am force-stop com.ubercab.driver 2>/dev/null
+                sleep 1
+
+                frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+                FRIDA_PID=$!
+                sleep 8
+
+                if kill -0 "$FRIDA_PID" 2>/dev/null && adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
+                    pass "App restarted successfully"
+                else
+                    warn "Restart failed"
+                fi
+            fi
+            sleep 3
+        else
+            # Frida process died
+            if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
+                warn "Frida detached but app is still running"
+                log "Re-attaching Frida..."
+                frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+                FRIDA_PID=$!
+                sleep 5
+            else
+                CRASH_COUNT=$((CRASH_COUNT + 1))
+                warn "Both Frida and app exited (crash #$CRASH_COUNT)"
+                if [ $CRASH_COUNT -ge $MAX_CRASHES ]; then
+                    fail "Too many crashes — stopping"
+                    cleanup
+                fi
+                warn "Auto-restarting..."
+                sleep 2
+                frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+                FRIDA_PID=$!
+                sleep 8
+            fi
+        fi
+    done
 else
     log "  ✗ ALL LAUNCH METHODS FAILED"
     log "============================================"
