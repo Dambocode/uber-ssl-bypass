@@ -421,37 +421,131 @@ if [ "$FRIDA_OK" != true ]; then
     exit 1
 fi
 
+# ── Install mitmproxy CA cert on device ──────────────────────────
+log ""
+log "--- CA Certificate ---"
+
+if [ "$HAS_ROOT" = true ]; then
+    MITM_CERT="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+
+    # Generate cert if it doesn't exist
+    if [ ! -f "$MITM_CERT" ]; then
+        log "Generating mitmproxy CA cert (first run)..."
+        mitmdump --listen-port 0 >> "$LOG" 2>&1 &
+        local TMPID=$!
+        sleep 3
+        kill "$TMPID" 2>/dev/null
+    fi
+
+    if [ -f "$MITM_CERT" ]; then
+        CERT_HASH=$(openssl x509 -inform PEM -subject_hash_old -in "$MITM_CERT" 2>/dev/null | head -1)
+        CERT_FILE="${CERT_HASH}.0"
+
+        if adb shell su -c "test -f /system/etc/security/cacerts/$CERT_FILE && echo yes" 2>/dev/null | grep -q "yes"; then
+            pass "mitmproxy CA already installed as system cert"
+        else
+            log "Installing mitmproxy CA as system cert ($CERT_FILE)..."
+            cp "$MITM_CERT" "/tmp/$CERT_FILE"
+            adb push "/tmp/$CERT_FILE" "/data/local/tmp/$CERT_FILE" >> "$LOG" 2>&1
+
+            # Try multiple mount methods (varies by Android version/device)
+            adb shell su -c "mount -o rw,remount /system" >> "$LOG" 2>&1 || \
+            adb shell su -c "mount -o rw,remount /" >> "$LOG" 2>&1 || true
+
+            adb shell su -c "cp /data/local/tmp/$CERT_FILE /system/etc/security/cacerts/$CERT_FILE" >> "$LOG" 2>&1
+            adb shell su -c "chmod 644 /system/etc/security/cacerts/$CERT_FILE" >> "$LOG" 2>&1
+            adb shell su -c "chcon u:object_r:system_file:s0 /system/etc/security/cacerts/$CERT_FILE" >> "$LOG" 2>&1
+
+            # Verify it took
+            if adb shell su -c "test -f /system/etc/security/cacerts/$CERT_FILE && echo yes" 2>/dev/null | grep -q "yes"; then
+                pass "CA cert installed as system cert"
+            else
+                warn "Could not install to /system — trying Magisk overlay method..."
+
+                # Android 14+ and some devices use read-only /system
+                # Use the /data/adb cert injection method
+                MAGISK_CERT_DIR="/data/adb/certificates"
+                adb shell su -c "mkdir -p $MAGISK_CERT_DIR" >> "$LOG" 2>&1
+                adb shell su -c "cp /data/local/tmp/$CERT_FILE $MAGISK_CERT_DIR/$CERT_FILE" >> "$LOG" 2>&1
+                adb shell su -c "chmod 644 $MAGISK_CERT_DIR/$CERT_FILE" >> "$LOG" 2>&1
+
+                # Also try the user cert store + Android Settings trust
+                adb push "$MITM_CERT" /data/local/tmp/mitmproxy-ca.pem >> "$LOG" 2>&1
+                # Install as user cert via am command
+                adb shell su -c "am start -a android.intent.action.INSTALL_CERTIFICATE -t application/x-x509-ca-cert -d file:///data/local/tmp/mitmproxy-ca.pem" >> "$LOG" 2>&1 || true
+
+                warn "CA cert may need manual trust — check Settings → Security → Encryption → Trusted credentials"
+                warn "Or install MagiskTrustUserCerts module in Magisk for automatic system trust"
+            fi
+
+            rm -f "/tmp/$CERT_FILE"
+        fi
+    else
+        warn "mitmproxy CA cert not found — HTTPS interception may not work"
+        warn "Run 'mitmdump' once manually to generate it, then re-run this script"
+    fi
+fi
+
 # ── Setup proxy ──────────────────────────────────────────────────
 log ""
 log "--- Proxy Setup ---"
 
 MITM_PID=""
 if [ "$HAS_MITM" = true ]; then
-    # Get Mac IP
+    # Get the IP the phone can actually reach
+    # Try all interfaces and pick the one on the same subnet as the phone
     PC_IP=""
+    PHONE_IP=$(adb shell ip route get 8.8.8.8 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | tr -d '\r\n')
+    PHONE_SUBNET=$(echo "$PHONE_IP" | awk -F. '{print $1"."$2"."$3}')
+    log "  Phone IP: ${PHONE_IP:-unknown} (subnet: ${PHONE_SUBNET:-unknown})"
+
     if [[ "$(uname)" == "Darwin" ]]; then
-        PC_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+        # Check all interfaces, find the one matching the phone's subnet
+        for iface in en0 en1 en2 en3 en4 en5 en6 en7 en8 bridge0; do
+            IFACE_IP=$(ipconfig getifaddr "$iface" 2>/dev/null)
+            if [ -n "$IFACE_IP" ]; then
+                IFACE_SUBNET=$(echo "$IFACE_IP" | awk -F. '{print $1"."$2"."$3}')
+                log "  Found $iface: $IFACE_IP (subnet: $IFACE_SUBNET)"
+                if [ "$IFACE_SUBNET" = "$PHONE_SUBNET" ]; then
+                    PC_IP="$IFACE_IP"
+                    log "  → Matched phone subnet!"
+                    break
+                fi
+                # Keep first IP as fallback
+                [ -z "$PC_IP" ] && PC_IP="$IFACE_IP"
+            fi
+        done
     elif hostname -I &>/dev/null; then
         PC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
     fi
 
     if [ -z "$PC_IP" ]; then
         warn "Could not detect PC IP — skipping proxy setup"
-        warn "Set manually: adb shell settings put global http_proxy YOUR_IP:8080"
+        warn "Set manually: adb shell settings put global http_proxy YOUR_IP:$PROXY_PORT"
     else
         pass "PC IP: $PC_IP"
+
+        # Verify the phone can reach us
+        log "Testing connectivity: phone → $PC_IP ..."
+        PING_OK=$(adb shell ping -c 1 -W 2 "$PC_IP" 2>/dev/null | grep -c "bytes from" || echo "0")
+        if [ "$PING_OK" -gt 0 ]; then
+            pass "Phone can reach $PC_IP"
+        else
+            warn "Phone cannot ping $PC_IP — proxy may not work"
+            warn "Make sure phone is on the same WiFi network"
+        fi
+
         adb shell settings put global http_proxy "$PC_IP:$PROXY_PORT"
         pass "Device proxy set to $PC_IP:$PROXY_PORT"
 
-        # Start mitmproxy in background
-        mitmdump --listen-port "$PROXY_PORT" \
-            --set "hardump=./$HAR" \
-            "~d uber.com | ~d oojoovae.org | ~d uberinternal.com" >> "$LOG" 2>&1 &
+        # Start mitmproxy in background — listen on all interfaces
+        mitmdump --listen-host 0.0.0.0 --listen-port "$PROXY_PORT" \
+            --set "hardump=./$HAR" >> "$LOG" 2>&1 &
         MITM_PID=$!
         sleep 2
 
         if kill -0 "$MITM_PID" 2>/dev/null; then
-            pass "mitmproxy running (PID $MITM_PID) → $HAR"
+            pass "mitmproxy running on 0.0.0.0:$PROXY_PORT (PID $MITM_PID) → $HAR"
         else
             warn "mitmproxy failed to start — capture will not work"
             warn "Check if port $PROXY_PORT is in use: lsof -i :$PROXY_PORT"
