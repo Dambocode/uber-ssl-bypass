@@ -269,40 +269,62 @@ upgrade_pc_frida() {
     log "(this may take 1-2 minutes — downloading native binaries)"
     echo ""
 
-    # On macOS, --break-system-packages is usually required
-    # Try it first since it's the most common case, show output so user sees progress
-    if pip3 install --break-system-packages --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
-        pass "PC frida upgraded"
-    elif pip3 install --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
-        pass "PC frida upgraded"
-    elif python3 -m pip install --break-system-packages --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
-        pass "PC frida upgraded (via python3 -m pip)"
-    else
+    UPGRADE_OK=false
+
+    # Method 1: plain pip3 (works on older macOS pip without --break-system-packages)
+    log "Trying: pip3 install --upgrade frida-tools frida"
+    if pip3 install --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
+        UPGRADE_OK=true
+    fi
+
+    # Method 2: with --break-system-packages (required on newer macOS pip)
+    if [ "$UPGRADE_OK" != true ]; then
+        log "Trying: pip3 install --break-system-packages --upgrade frida-tools frida"
+        if pip3 install --break-system-packages --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
+            UPGRADE_OK=true
+        fi
+    fi
+
+    # Method 3: python3 -m pip
+    if [ "$UPGRADE_OK" != true ]; then
+        log "Trying: python3 -m pip install --upgrade frida-tools frida"
+        if python3 -m pip install --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
+            UPGRADE_OK=true
+        fi
+    fi
+
+    # Method 4: pip (not pip3)
+    if [ "$UPGRADE_OK" != true ]; then
+        log "Trying: pip install --upgrade frida-tools frida"
+        if pip install --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
+            UPGRADE_OK=true
+        fi
+    fi
+
+    if [ "$UPGRADE_OK" != true ]; then
         fail "Could not upgrade frida automatically"
         echo ""
         echo "Try manually:"
-        echo "  pip3 install --break-system-packages --upgrade frida-tools frida"
+        echo "  pip3 install --upgrade frida-tools frida"
         echo ""
         echo "Or use a venv:"
-        echo "  python3 -m venv ~/frida-venv"
-        echo "  source ~/frida-venv/bin/activate"
+        echo "  python3 -m venv ~/frida-venv && source ~/frida-venv/bin/activate"
         echo "  pip install --upgrade frida-tools frida"
         echo "  Then re-run: ./start.sh --upgrade"
         return 1
     fi
 
-    # Refresh version
+    pass "PC frida upgraded"
+
+    # Refresh version — check PATH and common locations
     PC_FRIDA_VER=$(frida --version 2>/dev/null | tr -d '\r\n')
     if [ -z "$PC_FRIDA_VER" ]; then
-        # frida might not be in PATH after pip install — check common locations
         for FRIDA_BIN in "$HOME/Library/Python/3.*/bin/frida" "$HOME/.local/bin/frida" "/opt/homebrew/bin/frida" "/usr/local/bin/frida"; do
-            # shellcheck disable=SC2086
             FOUND=$(ls $FRIDA_BIN 2>/dev/null | head -1)
             if [ -n "$FOUND" ]; then
                 PC_FRIDA_VER=$("$FOUND" --version 2>/dev/null | tr -d '\r\n')
                 if [ -n "$PC_FRIDA_VER" ]; then
-                    warn "frida installed at $FOUND but not in PATH"
-                    echo "  Add to PATH: export PATH=\"$(dirname "$FOUND"):\$PATH\""
+                    warn "frida installed at $FOUND — add to PATH"
                     break
                 fi
             fi
@@ -312,9 +334,7 @@ upgrade_pc_frida() {
     if [ -n "$PC_FRIDA_VER" ]; then
         pass "PC frida now: v${PC_FRIDA_VER}"
     else
-        fail "frida command not found after install"
-        echo "  pip installed it but it's not in your PATH"
-        echo "  Try: export PATH=\"\$HOME/Library/Python/3.12/bin:\$PATH\""
+        fail "frida not in PATH after upgrade"
         return 1
     fi
     return 0
@@ -856,102 +876,102 @@ sleep 1
 LAUNCHED=false
 FRIDA_PID=""
 
-# Use SPAWN_MODE for launching (may differ from FRIDA_MODE — TCP for frida-ps, USB for spawn)
-log "Using spawn mode: $SPAWN_MODE"
-
-# Method 1: frida spawn with -f (preferred — hooks before app init)
-log "Trying: frida $SPAWN_MODE -f com.ubercab.driver -l $SCRIPT"
-frida $SPAWN_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
-FRIDA_PID=$!
-sleep 8
-
-if kill -0 "$FRIDA_PID" 2>/dev/null; then
-    if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
-        pass "Method 1 (spawn $SPAWN_MODE): App launched!"
-        LAUNCHED=true
-    else
-        kill "$FRIDA_PID" 2>/dev/null
-    fi
-else
-    log "Spawn exited early — check output above"
+# Build list of modes to try (deduplicate)
+MODES_TO_TRY="$FRIDA_MODE"
+if [ "$SPAWN_MODE" != "$FRIDA_MODE" ]; then
+    MODES_TO_TRY="$FRIDA_MODE $SPAWN_MODE"
 fi
+# Always include -U if not already there
+case "$MODES_TO_TRY" in
+    *"-U"*) ;;
+    *) MODES_TO_TRY="$MODES_TO_TRY -U" ;;
+esac
 
-# If spawn failed with SPAWN_MODE, try the other mode
-if [ "$LAUNCHED" != true ] && [ "$SPAWN_MODE" != "$FRIDA_MODE" ]; then
-    log "Spawn with $SPAWN_MODE failed, trying $FRIDA_MODE..."
-    adb shell am force-stop com.ubercab.driver 2>/dev/null
-    sleep 1
+# ── Method 1: spawn with -f (only if spawn test passed) ──────
+if [ "$SPAWN_OK" = true ]; then
+    log "Spawn test passed — trying frida -f spawn..."
+    for MODE in $MODES_TO_TRY; do
+        if [ "$LAUNCHED" = true ]; then break; fi
+        adb shell am force-stop com.ubercab.driver 2>/dev/null
+        sleep 1
 
-    frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
-    FRIDA_PID=$!
-    sleep 8
-
-    if kill -0 "$FRIDA_PID" 2>/dev/null; then
-        if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
-            pass "Spawn with $FRIDA_MODE worked!"
-            SPAWN_MODE="$FRIDA_MODE"
-            LAUNCHED=true
-        else
-            kill "$FRIDA_PID" 2>/dev/null
-        fi
-    fi
-fi
-
-# Method 2: attach after launching app normally
-if [ "$LAUNCHED" != true ]; then
-    log "Spawn methods failed, trying attach..."
-    adb shell am force-stop com.ubercab.driver 2>/dev/null
-    sleep 1
-
-    adb shell monkey -p com.ubercab.driver -c android.intent.category.LAUNCHER 1 >> "$LOG" 2>&1
-    sleep 3
-
-    # Try attach with SPAWN_MODE first, then FRIDA_MODE
-    for ATTACH_MODE in "$SPAWN_MODE" "$FRIDA_MODE"; do
-        log "Attaching with $ATTACH_MODE..."
-        frida $ATTACH_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+        log "Trying: frida $MODE -f com.ubercab.driver -l $SCRIPT"
+        frida $MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
         FRIDA_PID=$!
         sleep 8
 
         if kill -0 "$FRIDA_PID" 2>/dev/null; then
             if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
-                pass "Attach ($ATTACH_MODE): App running!"
-                SPAWN_MODE="$ATTACH_MODE"
+                pass "Spawn ($MODE): App launched!"
+                SPAWN_MODE="$MODE"
                 LAUNCHED=true
-                break
             else
                 kill "$FRIDA_PID" 2>/dev/null
             fi
         else
-            log "Attach with $ATTACH_MODE exited early"
+            log "Spawn with $MODE exited early"
         fi
     done
+else
+    warn "Spawn test failed — skipping spawn, using attach method"
 fi
 
-# Method 3: late attach (more time for app to initialize)
+# ── Method 2: start app normally, then attach Frida ──────────
 if [ "$LAUNCHED" != true ]; then
-    log "Trying late attach (5s delay)..."
-    adb shell am force-stop com.ubercab.driver 2>/dev/null
-    sleep 1
+    log "Using attach method (start app → attach Frida)..."
 
-    adb shell monkey -p com.ubercab.driver -c android.intent.category.LAUNCHER 1 >> "$LOG" 2>&1
-    sleep 5
+    for WAIT_TIME in 3 5 8; do
+        if [ "$LAUNCHED" = true ]; then break; fi
 
-    frida $SPAWN_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
-    FRIDA_PID=$!
-    sleep 8
+        # Make sure app is stopped
+        adb shell am force-stop com.ubercab.driver 2>/dev/null
+        sleep 1
 
-    if kill -0 "$FRIDA_PID" 2>/dev/null; then
-        if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
-            pass "Late attach: App running!"
-            warn "Some early hooks may have missed init"
-            LAUNCHED=true
-        else
-            kill "$FRIDA_PID" 2>/dev/null
+        # Start app normally
+        log "Starting Uber Driver..."
+        adb shell monkey -p com.ubercab.driver -c android.intent.category.LAUNCHER 1 >> "$LOG" 2>&1
+        sleep "$WAIT_TIME"
+
+        # Verify app is actually running before trying to attach
+        if ! adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
+            warn "App didn't start (waited ${WAIT_TIME}s) — Uber may be crashing on its own"
+            continue
         fi
-    else
-        log "Late attach exited early"
-    fi
+        pass "Uber Driver is running (PID: $(adb shell pidof com.ubercab.driver 2>/dev/null | tr -d '\r\n'))"
+
+        # Try each connection mode for attach
+        for MODE in $MODES_TO_TRY; do
+            if [ "$LAUNCHED" = true ]; then break; fi
+
+            # Re-check app is still alive
+            if ! adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
+                warn "App died before we could attach"
+                break
+            fi
+
+            log "Attaching: frida $MODE com.ubercab.driver -l $SCRIPT"
+            frida $MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+            FRIDA_PID=$!
+            sleep 5
+
+            if kill -0 "$FRIDA_PID" 2>/dev/null; then
+                if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
+                    pass "Attach ($MODE, ${WAIT_TIME}s delay): Success!"
+                    SPAWN_MODE="$MODE"
+                    LAUNCHED=true
+                else
+                    warn "App crashed right after Frida attached"
+                    kill "$FRIDA_PID" 2>/dev/null
+                fi
+            else
+                log "Attach with $MODE exited (connection closed?)"
+                # Check if app is still alive — if so, Frida failed, not the app
+                if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
+                    log "App still running — Frida connection issue, trying next mode"
+                fi
+            fi
+        done
+    done
 fi
 
 # ── Results ──────────────────────────────────────────────────────
