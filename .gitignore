@@ -1,0 +1,20 @@
+# Decompiled source (too large, regenerate with jadx)
+apk/jadx-output/
+
+# Original APK download (112MB, re-download from APKMirror)
+*.apkm
+
+# APK signature verification files
+*.idsig
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Captured traffic (generated at runtime)
+*.har
+*.mitm
+
+# mitmproxy certs (sensitive)
+.mitmproxy/

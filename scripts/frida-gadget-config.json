@@ -1,0 +1,7 @@
+{
+  "interaction": {
+    "type": "script",
+    "path": "/data/local/tmp/android_ssl_bypass.js",
+    "on_change": "reload"
+  }
+}

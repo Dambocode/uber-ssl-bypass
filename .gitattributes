@@ -1,0 +1,4 @@
+# Git LFS tracking for large binary files
+*.apk filter=lfs diff=lfs merge=lfs -text
+*.so filter=lfs diff=lfs merge=lfs -text
+*.jks filter=lfs diff=lfs merge=lfs -text
