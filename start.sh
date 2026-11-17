@@ -464,20 +464,76 @@ if [ "$HAS_ROOT" = true ]; then
     adb forward --remove-all 2>/dev/null
     sleep 2
 
-    # ── Try Method 1: TCP with adb forward (most reliable on macOS) ──
-    log "Starting Frida server (TCP + adb forward)..."
+    # First: verify the binary works by running it briefly in foreground
+    log "Testing if frida-server binary starts..."
+    FGOUT="/tmp/frida-fg-test"
+    adb shell su -c "$FRIDA_BINARY -l 0.0.0.0:27042" > "$FGOUT" 2>&1 &
+    FG_PID=$!
+    sleep 4
+
+    if kill -0 "$FG_PID" 2>/dev/null; then
+        pass "Frida server binary starts OK"
+        # It's running in foreground — kill it, we'll restart in background
+        kill "$FG_PID" 2>/dev/null
+        wait "$FG_PID" 2>/dev/null
+        adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
+        sleep 1
+    else
+        # Server crashed — show why
+        fail "Frida server crashed on startup!"
+        echo ""
+        echo "Server output:"
+        cat "$FGOUT" 2>/dev/null
+        echo ""
+        adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
+
+        # Check binary
+        BINARY_SIZE=$(adb shell su -c "ls -l $FRIDA_BINARY" 2>/dev/null | awk '{print $5}')
+        BINARY_PERMS=$(adb shell su -c "ls -l $FRIDA_BINARY" 2>/dev/null | awk '{print $1}')
+        log "Binary: $FRIDA_BINARY size=$BINARY_SIZE perms=$BINARY_PERMS"
+
+        if [ "${BINARY_SIZE:-0}" -lt 1000000 ] 2>/dev/null; then
+            fail "Binary too small ($BINARY_SIZE bytes) — download may have failed"
+            echo "  Try re-downloading:"
+            echo "    adb shell su -c 'rm $FRIDA_BINARY'"
+            echo "    ./start.sh --upgrade"
+        fi
+        echo ""
+    fi
+
+    # Now start in background and try connections
+    # ── Method 1: TCP with adb forward (most reliable on macOS) ──
+    log "Starting Frida server (TCP + adb forward on port 27042)..."
     adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:27042 >/dev/null 2>&1 &"
     sleep 3
+
+    # Verify it's actually running on the device
+    if adb shell su -c "pidof hluda-server" 2>/dev/null | grep -q "[0-9]"; then
+        pass "Frida server process is running (PID: $(adb shell su -c 'pidof hluda-server' 2>/dev/null | tr -d '\r\n'))"
+    else
+        warn "Frida server process NOT running — it crashed after starting"
+        # Try running without -l flag (default USB mode)
+        log "Trying without -l flag..."
+        adb shell su -c "nohup $FRIDA_BINARY >/dev/null 2>&1 &"
+        sleep 3
+        if adb shell su -c "pidof hluda-server" 2>/dev/null | grep -q "[0-9]"; then
+            pass "Frida server running in USB-only mode"
+        else
+            fail "Frida server keeps crashing"
+        fi
+    fi
+
     adb forward tcp:27042 tcp:27042 2>/dev/null
 
     if test_frida_ps "-H 127.0.0.1:27042"; then
         pass "Frida connected via TCP (port 27042 + adb forward)"
         FRIDA_MODE="-H 127.0.0.1:27042"
         FRIDA_OK=true
-    else
-        warn "TCP 27042 failed, trying USB mode..."
+    fi
 
-        # ── Try Method 2: USB mode ──────────────────────────────
+    # ── Method 2: USB mode ──────────────────────────────
+    if [ "$FRIDA_OK" != true ]; then
+        warn "TCP 27042 failed, trying USB mode..."
         adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
         sleep 1
         adb shell su -c "nohup $FRIDA_BINARY >/dev/null 2>&1 &"
@@ -487,28 +543,36 @@ if [ "$HAS_ROOT" = true ]; then
             pass "Frida connected via USB"
             FRIDA_MODE="-U"
             FRIDA_OK=true
-        else
-            warn "USB mode failed, trying TCP on port 1337..."
-
-            # ── Try Method 3: TCP on custom port ─────────────────
-            adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
-            sleep 1
-            adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:1337 >/dev/null 2>&1 &"
-            sleep 3
-            adb forward tcp:1337 tcp:1337 2>/dev/null
-
-            if test_frida_ps "-H 127.0.0.1:1337"; then
-                pass "Frida connected via TCP (port 1337)"
-                FRIDA_MODE="-H 127.0.0.1:1337"
-                FRIDA_OK=true
-            else
-                fail "All Frida connection methods failed"
-                echo ""
-                echo "Debug: run frida-server in foreground to see errors:"
-                echo "  adb shell su -c '/data/local/tmp/hluda-server'"
-                echo ""
-            fi
         fi
+    fi
+
+    # ── Method 3: TCP on custom port ─────────────────
+    if [ "$FRIDA_OK" != true ]; then
+        warn "USB mode failed, trying TCP on port 1337..."
+        adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
+        sleep 1
+        adb shell su -c "nohup $FRIDA_BINARY -l 0.0.0.0:1337 >/dev/null 2>&1 &"
+        sleep 3
+        adb forward tcp:1337 tcp:1337 2>/dev/null
+
+        if test_frida_ps "-H 127.0.0.1:1337"; then
+            pass "Frida connected via TCP (port 1337)"
+            FRIDA_MODE="-H 127.0.0.1:1337"
+            FRIDA_OK=true
+        fi
+    fi
+
+    if [ "$FRIDA_OK" != true ]; then
+        fail "All Frida connection methods failed"
+        echo ""
+        # Show what we know
+        log "Diagnostics:"
+        log "  Server process alive: $(adb shell su -c 'pidof hluda-server' 2>/dev/null || echo 'NO')"
+        log "  Device ports listening:"
+        adb shell su -c "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null" 2>&1 | grep -E "27042|1337|frida|hluda" | tee -a "$LOG" || echo "    (none found)"
+        log "  Foreground test output:"
+        cat "$FGOUT" 2>/dev/null | tee -a "$LOG"
+        echo ""
     fi
 else
     log "No root — trying Frida USB mode (may need manual frida-server start)"
