@@ -265,56 +265,38 @@ sync_client_to_version() {
 
 # Helper: upgrade PC frida-tools to latest
 upgrade_pc_frida() {
-    log "Upgrading PC frida-tools to latest..."
+    local OLD_VER=$(frida --version 2>/dev/null | tr -d '\r\n')
+    log "Upgrading PC frida from v${OLD_VER} to latest..."
     log "(this may take 1-2 minutes — downloading native binaries)"
     echo ""
 
     UPGRADE_OK=false
 
-    # Method 1: plain pip3 (works on older macOS pip without --break-system-packages)
-    log "Trying: pip3 install --upgrade frida-tools frida"
-    if pip3 install --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
-        UPGRADE_OK=true
-    fi
+    # --no-cache-dir forces pip to check PyPI instead of using cached "already satisfied"
+    # Try each pip variant until one works
+    for PIP_CMD in "pip3" "python3 -m pip" "pip"; do
+        if [ "$UPGRADE_OK" = true ]; then break; fi
 
-    # Method 2: with --break-system-packages (required on newer macOS pip)
-    if [ "$UPGRADE_OK" != true ]; then
-        log "Trying: pip3 install --break-system-packages --upgrade frida-tools frida"
-        if pip3 install --break-system-packages --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
+        log "Trying: $PIP_CMD install --no-cache-dir --upgrade frida-tools frida"
+        if $PIP_CMD install --no-cache-dir --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
+            UPGRADE_OK=true
+        elif $PIP_CMD install --no-cache-dir --break-system-packages --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
             UPGRADE_OK=true
         fi
-    fi
-
-    # Method 3: python3 -m pip
-    if [ "$UPGRADE_OK" != true ]; then
-        log "Trying: python3 -m pip install --upgrade frida-tools frida"
-        if python3 -m pip install --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
-            UPGRADE_OK=true
-        fi
-    fi
-
-    # Method 4: pip (not pip3)
-    if [ "$UPGRADE_OK" != true ]; then
-        log "Trying: pip install --upgrade frida-tools frida"
-        if pip install --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
-            UPGRADE_OK=true
-        fi
-    fi
+    done
 
     if [ "$UPGRADE_OK" != true ]; then
         fail "Could not upgrade frida automatically"
         echo ""
-        echo "Try manually:"
-        echo "  pip3 install --upgrade frida-tools frida"
+        echo "Run manually on the Mac:"
+        echo "  pip3 install --no-cache-dir --upgrade frida-tools frida"
         echo ""
         echo "Or use a venv:"
         echo "  python3 -m venv ~/frida-venv && source ~/frida-venv/bin/activate"
-        echo "  pip install --upgrade frida-tools frida"
+        echo "  pip install --no-cache-dir --upgrade frida-tools frida"
         echo "  Then re-run: ./start.sh --upgrade"
         return 1
     fi
-
-    pass "PC frida upgraded"
 
     # Refresh version — check PATH and common locations
     PC_FRIDA_VER=$(frida --version 2>/dev/null | tr -d '\r\n')
@@ -331,12 +313,21 @@ upgrade_pc_frida() {
         done
     fi
 
-    if [ -n "$PC_FRIDA_VER" ]; then
-        pass "PC frida now: v${PC_FRIDA_VER}"
-    else
+    if [ -z "$PC_FRIDA_VER" ]; then
         fail "frida not in PATH after upgrade"
         return 1
     fi
+
+    if [ "$PC_FRIDA_VER" = "$OLD_VER" ]; then
+        warn "Version unchanged at v${PC_FRIDA_VER} — pip may have a stale index"
+        echo ""
+        echo "Force install latest manually:"
+        echo "  pip3 install --no-cache-dir --force-reinstall frida-tools frida"
+        echo ""
+        return 1
+    fi
+
+    pass "PC frida upgraded: v${OLD_VER} → v${PC_FRIDA_VER}"
     return 0
 }
 
