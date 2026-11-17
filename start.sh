@@ -6,7 +6,8 @@
 #
 # Options:
 #   ./start.sh                     # auto-detect and sync versions
-#   ./start.sh --sync-server       # (recommended) download server to match your PC's frida
+#   ./start.sh --upgrade           # upgrade both PC + device to latest Frida (recommended for Android 16)
+#   ./start.sh --sync-server       # download server to match your PC's frida
 #   ./start.sh --sync-client       # downgrade PC frida to match server on device
 #   ./start.sh --skip-sync         # skip version check entirely
 
@@ -46,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --sync-server) SYNC_MODE="server"; shift ;;
         --sync-client) SYNC_MODE="client"; shift ;;
         --skip-sync) SYNC_MODE="skip"; shift ;;
+        --upgrade) SYNC_MODE="upgrade"; shift ;;
         --port) PROXY_PORT="$2"; shift 2 ;;
         *) shift ;;
     esac
@@ -261,7 +263,32 @@ sync_client_to_version() {
     return 0
 }
 
-if [ "$SYNC_MODE" = "skip" ]; then
+# Helper: upgrade PC frida-tools to latest
+upgrade_pc_frida() {
+    log "Upgrading PC frida-tools to latest..."
+    if pip3 install --upgrade frida-tools frida 2>/dev/null; then
+        pass "PC frida upgraded"
+    elif pip3 install --break-system-packages --upgrade frida-tools frida 2>/dev/null; then
+        pass "PC frida upgraded"
+    else
+        fail "Could not upgrade frida. Try manually:"
+        echo "  pip3 install --break-system-packages --upgrade frida-tools frida"
+        return 1
+    fi
+    PC_FRIDA_VER=$(frida --version 2>/dev/null | tr -d '\r\n')
+    pass "PC frida now: v${PC_FRIDA_VER}"
+    return 0
+}
+
+if [ "$SYNC_MODE" = "upgrade" ]; then
+    log "Upgrading to latest Frida (recommended for Android 16)..."
+    upgrade_pc_frida
+    # Kill old server so we push the new one
+    adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
+    sleep 1
+    push_frida_server "$PC_FRIDA_VER"
+
+elif [ "$SYNC_MODE" = "skip" ]; then
     log "Skipping version sync (--skip-sync)"
     if [ -z "$DEVICE_FRIDA_VER" ]; then
         warn "No frida-server on device — will try to push v${PC_FRIDA_VER}"
@@ -269,7 +296,6 @@ if [ "$SYNC_MODE" = "skip" ]; then
     fi
 
 elif [ -z "$DEVICE_FRIDA_VER" ]; then
-    # No server on device — download one matching the PC
     log "No frida-server on device. Downloading v${PC_FRIDA_VER} to match PC..."
     push_frida_server "$PC_FRIDA_VER"
 
@@ -277,7 +303,6 @@ elif [ "$PC_FRIDA_VER" = "$DEVICE_FRIDA_VER" ]; then
     pass "Versions match: v${PC_FRIDA_VER}"
 
 else
-    # MISMATCH
     warn "VERSION MISMATCH: PC v${PC_FRIDA_VER} ≠ Device v${DEVICE_FRIDA_VER}"
     echo ""
 
@@ -290,33 +315,20 @@ else
         sync_client_to_version "$DEVICE_FRIDA_VER"
 
     else
-        # Auto mode — recommend server sync (easier, no pip issues)
         warn "Auto-fixing: downloading frida-server v${PC_FRIDA_VER} for device"
-        warn "(This is the recommended fix — no pip changes needed on your PC)"
         echo ""
-        echo "  Other options if this fails:"
-        echo "    ./start.sh --sync-client    # downgrade PC frida to v${DEVICE_FRIDA_VER} instead"
-        echo "    ./start.sh --skip-sync      # skip version check"
+        echo "  If spawn fails ('connection closed'), try:"
+        echo "    ./start.sh --upgrade    # upgrade to latest Frida (best for Android 16)"
         echo ""
+        # Kill old server before pushing new one
+        adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
+        sleep 1
         push_frida_server "$PC_FRIDA_VER"
     fi
 
-    # Final check
     DEVICE_FRIDA_VER=$(adb shell su -c "$FRIDA_BINARY --version" 2>/dev/null | tr -d '\r\n')
     if [ "$PC_FRIDA_VER" != "$DEVICE_FRIDA_VER" ]; then
-        fail "Versions still don't match after sync: PC v${PC_FRIDA_VER} ≠ Device v${DEVICE_FRIDA_VER}"
-        echo ""
-        echo "Manual fix options:"
-        echo ""
-        echo "  Option 1 (recommended): Update server on device"
-        echo "    curl -sL https://github.com/frida/frida/releases/download/${PC_FRIDA_VER}/frida-server-${PC_FRIDA_VER}-android-${FRIDA_ARCH}.xz -o /tmp/frida-server.xz"
-        echo "    xz -d -f /tmp/frida-server.xz"
-        echo "    adb push /tmp/frida-server /data/local/tmp/hluda-server"
-        echo "    adb shell su -c 'chmod 755 /data/local/tmp/hluda-server'"
-        echo ""
-        echo "  Option 2: Downgrade PC frida"
-        echo "    pip3 install --break-system-packages frida==${DEVICE_FRIDA_VER}"
-        echo ""
+        fail "Versions still don't match: PC v${PC_FRIDA_VER} ≠ Device v${DEVICE_FRIDA_VER}"
         exit 1
     fi
 fi
@@ -434,6 +446,81 @@ if [ "$FRIDA_OK" != true ]; then
     echo "Full log: $LOG"
     exit 1
 fi
+
+# ── Spawn test: verify Frida can actually inject into a process ──
+log ""
+log "--- Spawn Test ---"
+log "Testing if Frida can spawn an app (using Settings)..."
+
+# Try spawn with current mode
+SPAWN_OK=false
+SPAWN_MODE="$FRIDA_MODE"
+
+# Test spawn: try to spawn Settings app
+frida $SPAWN_MODE -f com.android.settings -e 'console.log("spawn-test-ok")' > /tmp/spawn-test-out 2>&1 &
+SPAWN_PID=$!
+sleep 5
+
+if kill -0 "$SPAWN_PID" 2>/dev/null; then
+    if grep -q "spawn-test-ok" /tmp/spawn-test-out 2>/dev/null; then
+        pass "Spawn works with $SPAWN_MODE"
+        SPAWN_OK=true
+    fi
+    kill "$SPAWN_PID" 2>/dev/null
+else
+    # Spawn failed — check if "connection closed" error
+    if grep -q "connection closed" /tmp/spawn-test-out 2>/dev/null; then
+        warn "Spawn via $SPAWN_MODE failed: 'connection closed'"
+    fi
+fi
+
+# If TCP spawn failed, try USB mode for spawning
+if [ "$SPAWN_OK" != true ] && [ "$SPAWN_MODE" != "-U" ]; then
+    log "TCP spawn failed — trying USB mode for spawn..."
+    # Server is already running, just try USB
+    frida -U -f com.android.settings -e 'console.log("spawn-test-ok")' > /tmp/spawn-test-out 2>&1 &
+    SPAWN_PID=$!
+    sleep 5
+
+    if kill -0 "$SPAWN_PID" 2>/dev/null; then
+        if grep -q "spawn-test-ok" /tmp/spawn-test-out 2>/dev/null; then
+            pass "Spawn works with -U (USB mode)"
+            SPAWN_MODE="-U"
+            SPAWN_OK=true
+        fi
+        kill "$SPAWN_PID" 2>/dev/null
+    fi
+fi
+
+# If spawn still fails, the Frida version likely doesn't support this Android
+if [ "$SPAWN_OK" != true ]; then
+    warn "Frida spawn test FAILED — Frida v${PC_FRIDA_VER} may not support Android ${ANDROID_VER}"
+    echo ""
+    echo "  This is common on Android 14+ / Android 16."
+    echo ""
+    echo "  Fix: upgrade to the latest Frida which has better Android support:"
+    echo "    ./start.sh --upgrade"
+    echo ""
+    echo "  This will:"
+    echo "    1. pip upgrade frida-tools to latest"
+    echo "    2. Download matching frida-server"
+    echo "    3. Push to device and retry"
+    echo ""
+    if [ "$SYNC_MODE" != "upgrade" ]; then
+        fail "Run: ./start.sh --upgrade"
+        # Clean up settings app
+        adb shell am force-stop com.android.settings 2>/dev/null
+        exit 1
+    else
+        warn "Even latest Frida can't spawn — will try attach method instead"
+    fi
+fi
+
+# Clean up settings app from spawn test
+adb shell am force-stop com.android.settings 2>/dev/null
+
+# Use SPAWN_MODE for launching (may differ from FRIDA_MODE used for frida-ps)
+log "Spawn mode: $SPAWN_MODE (frida-ps mode: $FRIDA_MODE)"
 
 # ── Install mitmproxy CA cert on device ──────────────────────────
 log ""
@@ -710,6 +797,7 @@ if ! test_frida_ps "$FRIDA_MODE"; then
     adb forward tcp:27042 tcp:27042 2>/dev/null
     if test_frida_ps "-H 127.0.0.1:27042"; then
         FRIDA_MODE="-H 127.0.0.1:27042"
+        SPAWN_MODE="-H 127.0.0.1:27042"
         pass "Frida server restarted"
     else
         fail "Cannot restart Frida server"
@@ -725,80 +813,103 @@ sleep 1
 LAUNCHED=false
 FRIDA_PID=""
 
-# Create a tee pipe so Frida output goes to both screen AND log
-FRIDA_PIPE="/tmp/frida-output-$$"
-mkfifo "$FRIDA_PIPE" 2>/dev/null || true
+# Use SPAWN_MODE for launching (may differ from FRIDA_MODE — TCP for frida-ps, USB for spawn)
+log "Using spawn mode: $SPAWN_MODE"
 
 # Method 1: frida spawn with -f (preferred — hooks before app init)
-log "Trying: frida $FRIDA_MODE -f com.ubercab.driver -l $SCRIPT"
-frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+log "Trying: frida $SPAWN_MODE -f com.ubercab.driver -l $SCRIPT"
+frida $SPAWN_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
 FRIDA_PID=$!
 sleep 8
 
 if kill -0 "$FRIDA_PID" 2>/dev/null; then
     if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
-        pass "Method 1 (spawn): App launched!"
+        pass "Method 1 (spawn $SPAWN_MODE): App launched!"
         LAUNCHED=true
     else
         kill "$FRIDA_PID" 2>/dev/null
     fi
 else
-    log "Spawn process exited early — check output above for errors"
+    log "Spawn exited early — check output above"
 fi
 
-if [ "$LAUNCHED" != true ]; then
-    log "Method 1 failed, trying attach method..."
+# If spawn failed with SPAWN_MODE, try the other mode
+if [ "$LAUNCHED" != true ] && [ "$SPAWN_MODE" != "$FRIDA_MODE" ]; then
+    log "Spawn with $SPAWN_MODE failed, trying $FRIDA_MODE..."
     adb shell am force-stop com.ubercab.driver 2>/dev/null
     sleep 1
 
-    # Start the app normally
-    adb shell monkey -p com.ubercab.driver -c android.intent.category.LAUNCHER 1 >> "$LOG" 2>&1
-    sleep 3
-
-    # Attach with script
-    frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+    frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
     FRIDA_PID=$!
     sleep 8
 
     if kill -0 "$FRIDA_PID" 2>/dev/null; then
         if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
-            pass "Method 2 (attach): App launched!"
+            pass "Spawn with $FRIDA_MODE worked!"
+            SPAWN_MODE="$FRIDA_MODE"
             LAUNCHED=true
         else
             kill "$FRIDA_PID" 2>/dev/null
         fi
-    else
-        log "Attach process exited early — check output above for errors"
     fi
 fi
 
+# Method 2: attach after launching app normally
 if [ "$LAUNCHED" != true ]; then
-    log "Method 2 failed, trying late attach..."
+    log "Spawn methods failed, trying attach..."
     adb shell am force-stop com.ubercab.driver 2>/dev/null
     sleep 1
 
-    # Start app, wait longer, then attach
+    adb shell monkey -p com.ubercab.driver -c android.intent.category.LAUNCHER 1 >> "$LOG" 2>&1
+    sleep 3
+
+    # Try attach with SPAWN_MODE first, then FRIDA_MODE
+    for ATTACH_MODE in "$SPAWN_MODE" "$FRIDA_MODE"; do
+        log "Attaching with $ATTACH_MODE..."
+        frida $ATTACH_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+        FRIDA_PID=$!
+        sleep 8
+
+        if kill -0 "$FRIDA_PID" 2>/dev/null; then
+            if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
+                pass "Attach ($ATTACH_MODE): App running!"
+                SPAWN_MODE="$ATTACH_MODE"
+                LAUNCHED=true
+                break
+            else
+                kill "$FRIDA_PID" 2>/dev/null
+            fi
+        else
+            log "Attach with $ATTACH_MODE exited early"
+        fi
+    done
+fi
+
+# Method 3: late attach (more time for app to initialize)
+if [ "$LAUNCHED" != true ]; then
+    log "Trying late attach (5s delay)..."
+    adb shell am force-stop com.ubercab.driver 2>/dev/null
+    sleep 1
+
     adb shell monkey -p com.ubercab.driver -c android.intent.category.LAUNCHER 1 >> "$LOG" 2>&1
     sleep 5
 
-    frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+    frida $SPAWN_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
     FRIDA_PID=$!
     sleep 8
 
     if kill -0 "$FRIDA_PID" 2>/dev/null; then
         if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
-            pass "Method 3 (late attach): App launched!"
+            pass "Late attach: App running!"
             warn "Some early hooks may have missed init"
             LAUNCHED=true
         else
             kill "$FRIDA_PID" 2>/dev/null
         fi
     else
-        log "Late attach exited early — check output above for errors"
+        log "Late attach exited early"
     fi
 fi
-
-rm -f "$FRIDA_PIPE" 2>/dev/null
 
 # ── Results ──────────────────────────────────────────────────────
 log ""
@@ -880,7 +991,7 @@ if [ "$LAUNCHED" = true ]; then
                 adb shell am force-stop com.ubercab.driver 2>/dev/null
                 sleep 1
 
-                frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+                frida $SPAWN_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
                 FRIDA_PID=$!
                 sleep 8
 
@@ -896,7 +1007,7 @@ if [ "$LAUNCHED" = true ]; then
             if adb shell pidof com.ubercab.driver 2>/dev/null | grep -q "[0-9]"; then
                 warn "Frida detached but app is still running"
                 log "Re-attaching Frida..."
-                frida $FRIDA_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+                frida $SPAWN_MODE com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
                 FRIDA_PID=$!
                 sleep 5
             else
@@ -908,7 +1019,7 @@ if [ "$LAUNCHED" = true ]; then
                 fi
                 warn "Auto-restarting..."
                 sleep 2
-                frida $FRIDA_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
+                frida $SPAWN_MODE -f com.ubercab.driver -l "$SCRIPT" 2>&1 | tee -a "$LOG" &
                 FRIDA_PID=$!
                 sleep 8
             fi
