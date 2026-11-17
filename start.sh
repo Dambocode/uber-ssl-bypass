@@ -550,54 +550,89 @@ log ""
 log "--- Proxy Setup ---"
 
 MITM_PID=""
-if [ "$HAS_MITM" = true ]; then
-    # Get the IP the phone can actually reach
-    # Try all interfaces and pick the one on the same subnet as the phone
-    PC_IP=""
-    PHONE_IP=$(adb shell ip route get 8.8.8.8 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | tr -d '\r\n')
-    PHONE_SUBNET=$(echo "$PHONE_IP" | awk -F. '{print $1"."$2"."$3}')
-    log "  Phone IP: ${PHONE_IP:-unknown} (subnet: ${PHONE_SUBNET:-unknown})"
+PROXY_METHOD=""
 
+if [ "$HAS_MITM" = true ]; then
+    # Kill any leftover mitmdump from previous runs
+    killall mitmdump 2>/dev/null || true
+    # Kill anything on our proxy port
     if [[ "$(uname)" == "Darwin" ]]; then
-        # Check all interfaces, find the one matching the phone's subnet
-        for iface in en0 en1 en2 en3 en4 en5 en6 en7 en8 bridge0; do
-            IFACE_IP=$(ipconfig getifaddr "$iface" 2>/dev/null)
-            if [ -n "$IFACE_IP" ]; then
-                IFACE_SUBNET=$(echo "$IFACE_IP" | awk -F. '{print $1"."$2"."$3}')
-                log "  Found $iface: $IFACE_IP (subnet: $IFACE_SUBNET)"
-                if [ "$IFACE_SUBNET" = "$PHONE_SUBNET" ]; then
-                    PC_IP="$IFACE_IP"
-                    log "  → Matched phone subnet!"
-                    break
-                fi
-                # Keep first IP as fallback
-                [ -z "$PC_IP" ] && PC_IP="$IFACE_IP"
-            fi
-        done
-    elif hostname -I &>/dev/null; then
-        PC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+        lsof -ti :"$PROXY_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    else
+        fuser -k "$PROXY_PORT"/tcp 2>/dev/null || true
+    fi
+    sleep 1
+
+    # ── Method 1 (preferred): ADB reverse proxy ─────────────────
+    # Routes through USB cable — no WiFi needed, works across different networks
+    log "Trying ADB reverse proxy (USB tunnel)..."
+    if adb reverse tcp:"$PROXY_PORT" tcp:"$PROXY_PORT" 2>/dev/null; then
+        pass "ADB reverse tunnel: phone:$PROXY_PORT → Mac:$PROXY_PORT (via USB)"
+        adb shell settings put global http_proxy "127.0.0.1:$PROXY_PORT"
+        pass "Device proxy set to 127.0.0.1:$PROXY_PORT (through USB)"
+        PROXY_METHOD="adb-reverse"
+    else
+        warn "ADB reverse failed — falling back to WiFi proxy"
     fi
 
-    if [ -z "$PC_IP" ]; then
-        warn "Could not detect PC IP — skipping proxy setup"
-        warn "Set manually: adb shell settings put global http_proxy YOUR_IP:$PROXY_PORT"
-    else
-        pass "PC IP: $PC_IP"
+    # ── Method 2 (fallback): WiFi proxy ─────────────────────────
+    if [ -z "$PROXY_METHOD" ]; then
+        PC_IP=""
+        PHONE_IP=$(adb shell ip route get 8.8.8.8 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | tr -d '\r\n')
+        PHONE_SUBNET=$(echo "$PHONE_IP" | awk -F. '{print $1"."$2"."$3}')
+        log "  Phone IP: ${PHONE_IP:-unknown} (subnet: ${PHONE_SUBNET:-unknown})"
 
-        # Verify the phone can reach us
-        log "Testing connectivity: phone → $PC_IP ..."
-        PING_OK=$(adb shell ping -c 1 -W 2 "$PC_IP" 2>/dev/null | grep -c "bytes from" || echo "0")
-        if [ "$PING_OK" -gt 0 ]; then
-            pass "Phone can reach $PC_IP"
-        else
-            warn "Phone cannot ping $PC_IP — proxy may not work"
-            warn "Make sure phone is on the same WiFi network"
+        if [[ "$(uname)" == "Darwin" ]]; then
+            for iface in en0 en1 en2 en3 en4 en5 en6 en7 en8 bridge0; do
+                IFACE_IP=$(ipconfig getifaddr "$iface" 2>/dev/null)
+                if [ -n "$IFACE_IP" ]; then
+                    IFACE_SUBNET=$(echo "$IFACE_IP" | awk -F. '{print $1"."$2"."$3}')
+                    log "  Found $iface: $IFACE_IP (subnet: $IFACE_SUBNET)"
+                    if [ -n "$PHONE_SUBNET" ] && [ "$IFACE_SUBNET" = "$PHONE_SUBNET" ]; then
+                        PC_IP="$IFACE_IP"
+                        log "  → Matched phone subnet!"
+                        break
+                    fi
+                    [ -z "$PC_IP" ] && PC_IP="$IFACE_IP"
+                fi
+            done
+        elif hostname -I &>/dev/null; then
+            PC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
         fi
 
-        adb shell settings put global http_proxy "$PC_IP:$PROXY_PORT"
-        pass "Device proxy set to $PC_IP:$PROXY_PORT"
+        if [ -n "$PC_IP" ]; then
+            # Test if phone can reach this IP
+            PING_RESULT=$(adb shell ping -c 1 -W 2 "$PC_IP" 2>/dev/null | grep -c "bytes from" || true)
+            if [ "${PING_RESULT:-0}" -gt 0 ]; then
+                pass "Phone can reach $PC_IP"
+                adb shell settings put global http_proxy "$PC_IP:$PROXY_PORT"
+                pass "Device proxy set to $PC_IP:$PROXY_PORT (WiFi)"
+                PROXY_METHOD="wifi"
+            else
+                warn "Phone cannot reach $PC_IP — different networks"
+                warn "Phone is on ${PHONE_SUBNET:-unknown}.x, Mac is on $(echo "$PC_IP" | awk -F. '{print $1"."$2"."$3}').x"
+            fi
+        fi
+    fi
 
-        # Start mitmproxy in background — listen on all interfaces
+    # ── Method 3 (last resort): adb forward + iptables ──────────
+    if [ -z "$PROXY_METHOD" ]; then
+        warn "No direct route between phone and Mac"
+        warn "Trying adb forward with on-device iptables redirect..."
+
+        adb forward tcp:"$PROXY_PORT" tcp:"$PROXY_PORT" 2>/dev/null || true
+        # Redirect all HTTP traffic on the device to the forwarded port
+        adb shell su -c "iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-port $PROXY_PORT" 2>/dev/null || true
+        adb shell su -c "iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-port $PROXY_PORT" 2>/dev/null || true
+        adb shell settings put global http_proxy "127.0.0.1:$PROXY_PORT"
+        PROXY_METHOD="iptables"
+        warn "Using iptables redirect — this is experimental"
+    fi
+
+    if [ -n "$PROXY_METHOD" ]; then
+        log "Proxy method: $PROXY_METHOD"
+
+        # Start mitmproxy
         mitmdump --listen-host 0.0.0.0 --listen-port "$PROXY_PORT" \
             --set "hardump=./$HAR" >> "$LOG" 2>&1 &
         MITM_PID=$!
@@ -606,10 +641,43 @@ if [ "$HAS_MITM" = true ]; then
         if kill -0 "$MITM_PID" 2>/dev/null; then
             pass "mitmproxy running on 0.0.0.0:$PROXY_PORT (PID $MITM_PID) → $HAR"
         else
-            warn "mitmproxy failed to start — capture will not work"
-            warn "Check if port $PROXY_PORT is in use: lsof -i :$PROXY_PORT"
-            MITM_PID=""
+            warn "mitmproxy failed to start"
+
+            # Check what's on the port
+            BLOCKER=$(lsof -i :"$PROXY_PORT" 2>/dev/null | head -5)
+            if [ -n "$BLOCKER" ]; then
+                warn "Port $PROXY_PORT is still in use:"
+                echo "$BLOCKER" | tee -a "$LOG"
+                warn "Trying port 8888 instead..."
+
+                PROXY_PORT=8888
+                # Update device proxy
+                if [ "$PROXY_METHOD" = "adb-reverse" ]; then
+                    adb reverse tcp:$PROXY_PORT tcp:$PROXY_PORT 2>/dev/null
+                    adb shell settings put global http_proxy "127.0.0.1:$PROXY_PORT"
+                else
+                    adb shell settings put global http_proxy "$PC_IP:$PROXY_PORT"
+                fi
+
+                mitmdump --listen-host 0.0.0.0 --listen-port "$PROXY_PORT" \
+                    --set "hardump=./$HAR" >> "$LOG" 2>&1 &
+                MITM_PID=$!
+                sleep 2
+
+                if kill -0 "$MITM_PID" 2>/dev/null; then
+                    pass "mitmproxy running on 0.0.0.0:$PROXY_PORT (PID $MITM_PID) → $HAR"
+                else
+                    fail "mitmproxy won't start on port $PROXY_PORT either"
+                    MITM_PID=""
+                fi
+            else
+                fail "mitmproxy crashed — check debug.log for errors"
+                MITM_PID=""
+            fi
         fi
+    else
+        fail "Could not set up proxy — no route to phone"
+        warn "Connect phone to same WiFi as Mac, or check USB cable"
     fi
 fi
 
@@ -719,11 +787,13 @@ if [ "$LAUNCHED" = true ]; then
         echo ""
         log "Cleaning up..."
         adb shell settings put global http_proxy :0 2>/dev/null
+        adb reverse --remove-all 2>/dev/null
+        adb shell su -c "iptables -t nat -F OUTPUT" 2>/dev/null
         adb shell am force-stop com.ubercab.driver 2>/dev/null
         adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
         [ -n "$MITM_PID" ] && kill "$MITM_PID" 2>/dev/null
         [ -n "$FRIDA_PID" ] && kill "$FRIDA_PID" 2>/dev/null
-        pass "Proxy cleared, processes stopped"
+        pass "Proxy cleared, ADB reverse removed, processes stopped"
         if [ -f "./$HAR" ]; then
             HAR_SIZE=$(ls -lh "./$HAR" 2>/dev/null | awk '{print $5}')
             pass "HAR saved: $HAR ($HAR_SIZE)"
