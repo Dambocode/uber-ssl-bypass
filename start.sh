@@ -266,23 +266,66 @@ sync_client_to_version() {
 # Helper: upgrade PC frida-tools to latest
 upgrade_pc_frida() {
     log "Upgrading PC frida-tools to latest..."
-    if pip3 install --upgrade frida-tools frida 2>/dev/null; then
+    log "(this may take 1-2 minutes — downloading native binaries)"
+    echo ""
+
+    # On macOS, --break-system-packages is usually required
+    # Try it first since it's the most common case, show output so user sees progress
+    if pip3 install --break-system-packages --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
         pass "PC frida upgraded"
-    elif pip3 install --break-system-packages --upgrade frida-tools frida 2>/dev/null; then
+    elif pip3 install --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
         pass "PC frida upgraded"
+    elif python3 -m pip install --break-system-packages --upgrade frida-tools frida 2>&1 | tee -a "$LOG"; then
+        pass "PC frida upgraded (via python3 -m pip)"
     else
-        fail "Could not upgrade frida. Try manually:"
+        fail "Could not upgrade frida automatically"
+        echo ""
+        echo "Try manually:"
         echo "  pip3 install --break-system-packages --upgrade frida-tools frida"
+        echo ""
+        echo "Or use a venv:"
+        echo "  python3 -m venv ~/frida-venv"
+        echo "  source ~/frida-venv/bin/activate"
+        echo "  pip install --upgrade frida-tools frida"
+        echo "  Then re-run: ./start.sh --upgrade"
         return 1
     fi
+
+    # Refresh version
     PC_FRIDA_VER=$(frida --version 2>/dev/null | tr -d '\r\n')
-    pass "PC frida now: v${PC_FRIDA_VER}"
+    if [ -z "$PC_FRIDA_VER" ]; then
+        # frida might not be in PATH after pip install — check common locations
+        for FRIDA_BIN in "$HOME/Library/Python/3.*/bin/frida" "$HOME/.local/bin/frida" "/opt/homebrew/bin/frida" "/usr/local/bin/frida"; do
+            # shellcheck disable=SC2086
+            FOUND=$(ls $FRIDA_BIN 2>/dev/null | head -1)
+            if [ -n "$FOUND" ]; then
+                PC_FRIDA_VER=$("$FOUND" --version 2>/dev/null | tr -d '\r\n')
+                if [ -n "$PC_FRIDA_VER" ]; then
+                    warn "frida installed at $FOUND but not in PATH"
+                    echo "  Add to PATH: export PATH=\"$(dirname "$FOUND"):\$PATH\""
+                    break
+                fi
+            fi
+        done
+    fi
+
+    if [ -n "$PC_FRIDA_VER" ]; then
+        pass "PC frida now: v${PC_FRIDA_VER}"
+    else
+        fail "frida command not found after install"
+        echo "  pip installed it but it's not in your PATH"
+        echo "  Try: export PATH=\"\$HOME/Library/Python/3.12/bin:\$PATH\""
+        return 1
+    fi
     return 0
 }
 
 if [ "$SYNC_MODE" = "upgrade" ]; then
     log "Upgrading to latest Frida (recommended for Android 16)..."
-    upgrade_pc_frida
+    if ! upgrade_pc_frida; then
+        fail "Upgrade failed — cannot continue"
+        exit 1
+    fi
     # Kill old server so we push the new one
     adb shell su -c "pkill -9 -f hluda-server" 2>/dev/null
     sleep 1
