@@ -460,22 +460,81 @@ if [ "$HAS_ROOT" = true ]; then
             if adb shell su -c "test -f /system/etc/security/cacerts/$CERT_FILE && echo yes" 2>/dev/null | grep -q "yes"; then
                 pass "CA cert installed as system cert"
             else
-                warn "Could not install to /system — trying Magisk overlay method..."
+                warn "Could not install to /system (read-only on Android 14+)"
+                log "Auto-installing MagiskTrustUserCerts module..."
 
-                # Android 14+ and some devices use read-only /system
-                # Use the /data/adb cert injection method
-                MAGISK_CERT_DIR="/data/adb/certificates"
-                adb shell su -c "mkdir -p $MAGISK_CERT_DIR" >> "$LOG" 2>&1
-                adb shell su -c "cp /data/local/tmp/$CERT_FILE $MAGISK_CERT_DIR/$CERT_FILE" >> "$LOG" 2>&1
-                adb shell su -c "chmod 644 $MAGISK_CERT_DIR/$CERT_FILE" >> "$LOG" 2>&1
-
-                # Also try the user cert store + Android Settings trust
+                # Install mitmproxy cert as user cert first
                 adb push "$MITM_CERT" /data/local/tmp/mitmproxy-ca.pem >> "$LOG" 2>&1
-                # Install as user cert via am command
-                adb shell su -c "am start -a android.intent.action.INSTALL_CERTIFICATE -t application/x-x509-ca-cert -d file:///data/local/tmp/mitmproxy-ca.pem" >> "$LOG" 2>&1 || true
+                # Copy to user cert store with correct name
+                adb shell su -c "mkdir -p /data/misc/user/0/cacerts-added" >> "$LOG" 2>&1
+                adb shell su -c "cp /data/local/tmp/$CERT_FILE /data/misc/user/0/cacerts-added/$CERT_FILE" >> "$LOG" 2>&1
+                adb shell su -c "chmod 644 /data/misc/user/0/cacerts-added/$CERT_FILE" >> "$LOG" 2>&1
+                adb shell su -c "chown system:system /data/misc/user/0/cacerts-added/$CERT_FILE" >> "$LOG" 2>&1
 
-                warn "CA cert may need manual trust — check Settings → Security → Encryption → Trusted credentials"
-                warn "Or install MagiskTrustUserCerts module in Magisk for automatic system trust"
+                # Download and install MagiskTrustUserCerts module
+                TRUST_MODULE_URL="https://github.com/NVISOsecurity/MagiskTrustUserCerts/releases/download/v0.4.1/AlwaysTrustUserCerts.zip"
+                TRUST_MODULE="/tmp/MagiskTrustUserCerts.zip"
+
+                if [ ! -f "$TRUST_MODULE" ]; then
+                    log "Downloading MagiskTrustUserCerts module..."
+                    curl -sL "$TRUST_MODULE_URL" -o "$TRUST_MODULE" 2>> "$LOG"
+                fi
+
+                if [ -f "$TRUST_MODULE" ] && [ -s "$TRUST_MODULE" ]; then
+                    log "Pushing module to device..."
+                    adb push "$TRUST_MODULE" /data/local/tmp/MagiskTrustUserCerts.zip >> "$LOG" 2>&1
+
+                    # Install via Magisk's module install command
+                    log "Installing module via Magisk..."
+                    adb shell su -c "magisk --install-module /data/local/tmp/MagiskTrustUserCerts.zip" >> "$LOG" 2>&1
+                    MAGISK_INSTALL_EXIT=$?
+
+                    if [ $MAGISK_INSTALL_EXIT -eq 0 ]; then
+                        pass "MagiskTrustUserCerts module installed"
+                        warn "REBOOT REQUIRED — the module promotes user certs to system on boot"
+                        echo ""
+                        echo "  Reboot now?  adb reboot"
+                        echo "  Then re-run: ./start.sh"
+                        echo ""
+
+                        # Check if user cert is at least in place
+                        if adb shell su -c "test -f /data/misc/user/0/cacerts-added/$CERT_FILE && echo yes" 2>/dev/null | grep -q "yes"; then
+                            pass "User cert in place — will be promoted to system after reboot"
+                        fi
+                    else
+                        warn "Magisk module install failed (exit $MAGISK_INSTALL_EXIT)"
+                        warn "Install manually: Magisk → Modules → Install from storage → select MagiskTrustUserCerts.zip"
+
+                        # Try alternative: direct module placement
+                        log "Trying direct module placement..."
+                        MODULE_DIR="/data/adb/modules/AlwaysTrustUserCerts"
+                        adb shell su -c "mkdir -p $MODULE_DIR/system/etc/security/cacerts" >> "$LOG" 2>&1
+                        adb shell su -c "cp /data/local/tmp/$CERT_FILE $MODULE_DIR/system/etc/security/cacerts/$CERT_FILE" >> "$LOG" 2>&1
+                        adb shell su -c "chmod 644 $MODULE_DIR/system/etc/security/cacerts/$CERT_FILE" >> "$LOG" 2>&1
+
+                        # Create minimal module.prop
+                        adb shell su -c "cat > $MODULE_DIR/module.prop << 'MODEOF'
+id=AlwaysTrustUserCerts
+name=Always Trust User Certificates
+version=v0.4.1
+versionCode=4
+author=NVISO
+description=Promotes user CA certs to system level
+MODEOF" >> "$LOG" 2>&1
+
+                        if adb shell su -c "test -f $MODULE_DIR/module.prop && echo yes" 2>/dev/null | grep -q "yes"; then
+                            pass "Module placed manually in /data/adb/modules/"
+                            warn "REBOOT REQUIRED to activate"
+                        else
+                            fail "Could not install cert or module"
+                            warn "Manual fix: open Magisk → Modules → install MagiskTrustUserCerts from GitHub"
+                        fi
+                    fi
+                else
+                    warn "Could not download MagiskTrustUserCerts module"
+                    warn "Download manually from: $TRUST_MODULE_URL"
+                    warn "Then install in Magisk → Modules → Install from storage"
+                fi
             fi
 
             rm -f "/tmp/$CERT_FILE"
