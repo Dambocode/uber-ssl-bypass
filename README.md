@@ -12,6 +12,8 @@ Full SSL pinning bypass for the Uber Driver app (`com.ubercab.driver` v4.603.100
 - [Critical Findings](#critical-findings)
 - [Uber API Domains](#uber-api-domains)
 - [Target Flows: Auth & Payout](#target-flows-auth--payout)
+- [Play Integrity & Request Attestation](#play-integrity--request-attestation)
+- [Automation Options](#automation-options-if-play-integrity-is-enforced)
 - [Installation](#installation)
 - [Proxy & HAR Capture](#proxy--har-capture)
 - [Troubleshooting](#troubleshooting)
@@ -305,6 +307,146 @@ pip install mitmproxy-addon-grpc
 2. If payment endpoints work on emulator, you have everything
 3. If blocked by attestation, **switch to the Pixel** — real device gives better integrity scores
 4. If even Pixel is blocked on payment ops, you'll need Magisk (root + Zygisk) on a rootable device to pass Play Integrity with the original signed APK
+
+---
+
+## Play Integrity & Request Attestation
+
+### How Uber's Attestation Works
+
+Uber has an **OkHttp interceptor** (`C109104f`) and a **gRPC interceptor** (`C109095b`) that transparently add attestation headers to matching requests:
+
+| Header | Purpose |
+|--------|---------|
+| `x-uber-sig` | Cryptographic signature (method + path + body hash + selected headers) |
+| `x-uber-sig-params` | Signature algorithm/version (`a=<algo>;v=1`) |
+| `x-uber-cit` | Client Integrity Token (from Google Play Integrity API) |
+| `Repr-Digest` | SHA-256 hash of request body |
+
+### Key Finding: Server-Driven Enforcement
+
+The endpoint list is **NOT hardcoded** in the APK. It's pushed from Uber's server via remote config:
+
+- **`rs_attested_endpoints`** (remote config param, default: `""` empty string) — comma-separated URL path patterns loaded from `mobile_security_mobile` category
+- **`rs_enable_grpc_attestation`** — defaults to `false`
+- **`rs_kill_switch`** — when `true`, disables ALL attestation (defaults to `false`)
+- Pattern matching supports `{}`-style path templates (e.g., `/api/payments/{}/disburse`)
+
+**The first HAR capture reveals the actual enforcement list** — look for the remote config response containing `rs_attested_endpoints`.
+
+### Error Codes When Attestation Fails
+
+The server returns `RequestIntegrityError` with these codes:
+
+| Code | Meaning |
+|------|---------|
+| `NEEDS_ATTESTATION` | Endpoint requires attestation, none provided (auto-retried) |
+| `SIGNATURE_INVALID` | `x-uber-sig` doesn't match |
+| `TOKEN_INVALID` | `x-uber-cit` expired or malformed (auto-retried) |
+| `INSUFFICIENT_APP_SCOPE` | App integrity failed (re-signed APK detected) |
+| `INSUFFICIENT_DEVICE_SCOPE` | Device integrity failed (emulator/rooted) |
+| `MISSING_DIGEST_HEADER` | `Repr-Digest` header missing |
+
+### Impact on Patched APK
+
+On a re-signed APK:
+- `MEETS_APP_INTEGRITY` → **FAIL** (different signing certificate)
+- `MEETS_DEVICE_INTEGRITY` → **PASS** on real Pixel, **FAIL** on emulator
+- `MEETS_STRONG_INTEGRITY` → **FAIL** (requires Play Store install + stock bootloader)
+
+The deposit switch action (`SetScheduledDisbursementPreferenceAction`) goes through native gRPC/OkHttp — if the server pushes it into `rs_attested_endpoints`, it will be gated.
+
+---
+
+## Automation Options (If Play Integrity Is Enforced)
+
+If HAR capture reveals that payout endpoints require `x-uber-cit` and the server hard-rejects with `INSUFFICIENT_APP_SCOPE`, here are the options for automation:
+
+### Option 1: In-Process Frida Automation (Recommended)
+
+Make API calls **from inside the Uber app process** using Frida's `Java.perform()`. The app's own interceptors automatically attach valid attestation headers.
+
+```
+┌─────────────┐    ┌──────────────────┐    ┌──────────────┐
+│ Your Server  │───▶│  Frida Script     │───▶│  Uber's Own   │
+│ (sends cmd)  │    │  (inside app)     │    │  HTTP Client   │
+└─────────────┘    └──────────────────┘    └──────────────┘
+                          │                        │
+                          │  Java.perform() calls  │  Interceptors add
+                          │  OkHttp/gRPC directly  │  x-uber-cit auto
+```
+
+**Setup:**
+- Rootable Android device (used Pixel 4a/5a, ~$100-150, unlockable bootloader)
+- Magisk + Play Integrity Fix (passes all integrity checks)
+- **Original** Uber Driver APK from Play Store (not patched — real signing key)
+- Frida server (not gadget) running as root
+- Automation script that exposes a local HTTP API and calls Uber's internal classes
+
+**Why it works:** You never forge a token. The real app on a real device generates legitimate Play Integrity tokens. You programmatically trigger the same code paths as a user tap.
+
+**Key classes for automation:**
+```
+SetScheduledDisbursementPreferenceAction  → switch direct deposit
+PaymentProfileSetAsDefault                → set default payment profile
+  - DefaultType.DRIVER_DISBURSEMENT       → disbursement type enum
+  - PaymentProfileUuid                    → target bank account ID
+CashOutActionFlow                         → instant pay / cashout
+BankAccountAddFlowPluginFactory           → add bank account
+BankAccountDescriptor                     → bank account metadata
+```
+
+### Option 2: Web Dashboard Automation (No Play Integrity)
+
+Uber has web-based payment pages that use **cookie-based auth, no Play Integrity**:
+
+| URL | Purpose |
+|-----|---------|
+| `drivers.uber.com/earnings/webview/` | Earnings viewing |
+| `partners.uber.com/p3/payments/v2/trips/` | Trip payment details |
+| `partners.uber.com/p3/payments/hcv-driver-fixed-schedule` | Payment scheduling |
+| `partners.uber.com/p3/payments/quality-hub/breakdowns/` | Quality hub metrics |
+
+> **Note:** `partners.uber.com` and `drivers.uber.com` are interchangeable — the app replaces one with the other. Both are in the trusted host list.
+
+> **Important:** The decompiled APK only references *some* web URLs. The web dashboard may have additional pages for deposit management that aren't referenced in the mobile app. **Check `drivers.uber.com` in a browser first.**
+
+The app uses `PaymentPresidioWebviewInteractor` to load payment pages in WebView with standard session cookies. If deposit switching exists on the web dashboard:
+
+```python
+# Automate with Playwright — no Play Integrity needed
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch()
+    page = browser.new_page()
+    # Login and navigate to payment settings
+    page.goto("https://drivers.uber.com")
+    # ... automate deposit switch
+```
+
+### Option 3: Uber Fleet/Partner API
+
+No fleet-level payment management API was found in the decompiled APK. The "fleet" references are limited to `fleet_break_management` (driver break scheduling). If your compliance use case qualifies for Uber's partner program, inquire about API access directly.
+
+### Decision Flowchart
+
+```
+1. Capture HAR with patched APK
+   │
+   ├─ Payout endpoints have NO x-uber-cit header?
+   │  └─ ✅ Direct API calls with auth tokens — done
+   │
+   ├─ Payout endpoints have x-uber-cit but server returns 200?
+   │  └─ ✅ Soft enforcement — direct API calls work — done
+   │
+   └─ Server returns INSUFFICIENT_APP_SCOPE / INSUFFICIENT_DEVICE_SCOPE?
+      │
+      ├─ Check drivers.uber.com for deposit management in browser
+      │  └─ Found? → ✅ Playwright automation — done
+      │
+      └─ Not on web? → Option 1: Rooted device + original APK + Frida server
+```
 
 ---
 
