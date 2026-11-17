@@ -56,7 +56,7 @@ echo ""
 
 # ── Step 1: Detect device architecture ───────────────────────────
 echo "[*] Detecting device architecture..."
-ARCH=$(adb shell getprop ro.product.cpu.abi)
+ARCH=$(adb shell getprop ro.product.cpu.abi | tr -d '\r\n')
 echo "[+] Architecture: $ARCH"
 
 case "$ARCH" in
@@ -79,7 +79,16 @@ else
     echo "[*] Downloading Frida server $FRIDA_VERSION..."
     if [ ! -f "/tmp/${FRIDA_NAME}" ]; then
         curl -sL "$FRIDA_URL" -o "/tmp/${FRIDA_NAME}.xz"
-        xz -d -f "/tmp/${FRIDA_NAME}.xz"
+        # xz may not be installed on macOS — try python as fallback
+        if command -v xz &>/dev/null; then
+            xz -d -f "/tmp/${FRIDA_NAME}.xz"
+        elif command -v python3 &>/dev/null; then
+            python3 -c "import lzma,sys; open(sys.argv[2],'wb').write(lzma.open(sys.argv[1]).read())" \
+                "/tmp/${FRIDA_NAME}.xz" "/tmp/${FRIDA_NAME}"
+        else
+            echo "[!] xz not found. Install with: brew install xz"
+            exit 1
+        fi
     fi
 
     echo "[*] Pushing Frida server to device (renamed to hluda-server)..."

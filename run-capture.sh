@@ -44,10 +44,22 @@ else
 fi
 sleep 2
 
-# Get PC IP for proxy
-PC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-if [ -z "$PC_IP" ]; then
+# Get PC IP for proxy (works on macOS, Linux, and Windows/Git Bash)
+PC_IP=""
+if command -v ipconfig &>/dev/null && [[ "$(uname)" == "Darwin" ]]; then
+    # macOS
+    PC_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+elif command -v hostname &>/dev/null && hostname -I &>/dev/null; then
+    # Linux
+    PC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+else
+    # Windows / Git Bash
     PC_IP=$(ipconfig 2>/dev/null | grep -A4 "Wi-Fi\|Ethernet" | grep "IPv4" | head -1 | awk '{print $NF}')
+fi
+
+if [ -z "$PC_IP" ]; then
+    echo "[!] Could not detect PC IP. Enter it manually:"
+    read -r PC_IP
 fi
 
 # Set device proxy
