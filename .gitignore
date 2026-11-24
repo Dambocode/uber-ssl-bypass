@@ -1,11 +1,24 @@
 # Decompiled source (too large, regenerate with jadx)
 apk/jadx-output/
 
-# Original APK download (112MB, re-download from APKMirror)
+# APK files (too large for git)
+apk/
+*.apk
+*.xapk
 *.apkm
-
-# APK signature verification files
 *.idsig
+
+# Sensitive session data
+cookie-dump/auth_state.json
+cookie-dump/login_state.json
+cookie-dump/chrome_cookies.json
+
+# Large JS bundles (fetched from Uber CDN, not source)
+cookie-dump/client-main-*.js
+cookie-dump/client-*.js
+
+# Auth page HTML (contains session-specific tokens)
+cookie-dump/auth_page.html
 
 # OS files
 .DS_Store
@@ -18,3 +31,8 @@ desktop.ini
 
 # mitmproxy certs (sensitive)
 .mitmproxy/
+
+# Python
+__pycache__/
+*.pyc
+.env
